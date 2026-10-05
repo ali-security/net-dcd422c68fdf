@@ -1,0 +1,86 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: Build module zip
+        run: |
+          set -eux
+          helper="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$helper/main.go"
+          sed -i '/^\/\/go:build ignore$/d' "$helper/main.go"
+          cd "$helper"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          mkdir -p "$RUNNER_TEMP/dist"
+          "$RUNNER_TEMP/create_mod" golang.org/x/net v0.45.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/dist/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/dist/v0.45.0.zip" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v0.45.0.zip
+          path: ${{ runner.temp }}/dist/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: Go version
+        run: go version
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/go-test.log"
+          if [ -n "$TEST_FILTER" ]; then
+            pattern="^($(echo "$TEST_FILTER" | tr ' ' '|'))\$"
+            go test -v -run "$pattern" ./... 2>&1 | tee "$log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|\$)" "$log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$log"
+          fi
+          echo "===== go test summary ====="
+          awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} /^ok[[:space:]]/{ok++} END{printf "tests passed: %d, failed: %d, skipped: %d, packages ok: %d\n", p, f, s, ok}' "$log"
